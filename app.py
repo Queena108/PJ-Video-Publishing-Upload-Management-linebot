@@ -84,7 +84,7 @@ def get_today_rows(sheet=None):
                 "date": row[0], "slot": row[2],
                 "name": row[3], "ep":   row[4],
                 "IG_FB": row[5], "TK": row[6], "YT": row[7],
-                "status": row[8],
+               "status": row[9],
             })
     return results
 
