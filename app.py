@@ -68,8 +68,7 @@ def get_sheet():
     creds  = Credentials.from_service_account_info(info, scopes=scopes)
     gc     = gspread.authorize(creds)
     month  = datetime.datetime.now(TZ).month
-    url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
-    return gc.open_by_url(url).worksheet(f"{month:02d}月確認表")
+    return gc.open_by_key(SHEET_ID).worksheet(f"{month:02d}月確認表")
 
 def get_today_rows(sheet=None):
     if sheet is None:
