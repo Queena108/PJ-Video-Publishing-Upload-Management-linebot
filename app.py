@@ -32,28 +32,34 @@ STATUS_MAP = {
     "未排程": "—未排程", "不上": "—未排程", "\\未排程": "—未排程",
 }
 
-# ── 節目別名優化 ──
+# ── 節目別名 ──
 SHOW_ALIASES = {
     "董律": "董律師", "董律師": "董律師",
     "蟎人": "蟎人",
     "aida": "AIDA", "AIDA": "AIDA",
     "mico": "MICO", "MICO": "MICO",
-    "真心話": "真心話", "真心話長": "真心話", "真心話短": "真心話",
+    "真心話長": "真心話長", "真心話短": "真心話短", "真心話": "真心話短",
     "芯芯": "芯芯",
     "而璽": "而璽", "而璽設計": "而璽",
-    "今晚": "今晚", "今晚長": "今晚", "今晚短": "今晚",
+    "今晚": "今晚", "今晚長": "今晚長", "今晚短": "今晚短",
 }
 
-# ── 節目→排程表欄位對應 (根據 04月排程表 CSV 結構) ──
-# 第 3 欄是日期，第 4 欄開始是 IP
+# ── 節目→排程表欄位對應 ──
+# 4月排程表 & 所有IP的3月區塊（col 4-11）
 SHOW_COL_BASE = {
     "董律師": 4, "蟎人": 5, "AIDA": 6, "MICO": 7,
-    "真心話": 8, "芯芯": 9, "而璽": 10, "今晚": 11,
+    "真心話短": 8, "真心話長": 8, "芯芯": 9, "而璽": 10, "今晚": 11,
+}
+# 所有IP 4月區塊（+12）
+SHOW_COL_APR_ALLIP = {k: v+12 for k, v in SHOW_COL_BASE.items()}
+
+# 節目在排程表裡的顯示前綴（縮寫）
+SHOW_PREFIX = {
+    "董律師": "董律", "蟎人": "蟎人", "AIDA": "AIDA", "MICO": "MICO",
+    "真心話短": "真心話短", "真心話長": "真心話長",
+    "芯芯": "芯芯", "而璽": "而璽", "今晚": "今晚",
 }
 
-# 所有 IP 表中，4 月份的區塊從第 15 欄(日期)開始，IP 從第 16 欄開始
-# 計算方式：SHOW_COL_BASE(4) + 12 = 16 (董律師在 4 月區塊的位置)
-SHOW_COL_APR_ALLIP = {k: v + 12 for k, v in SHOW_COL_BASE.items()}
 S_SCHED = "已排程"; S_DONE = "✓ 已上片"
 S_ERR   = "⚠ 不上片"; S_SKIP = "—未排程"
 
@@ -363,7 +369,17 @@ def delete_ep_from_sheets(show_name, ep_num=None, date_str=None):
             except: pass
     ep_str = f"EP{ep_num}" if ep_num else None
 
-    # 確認表
+    def is_hit(cur_ep, cur_date):
+        has_ep_num = bool(re.search(r'EP\d', str(cur_ep)))
+        if ep_str and target_date:
+            return ep_str.upper() in str(cur_ep).upper() and cur_date == target_date
+        elif ep_str:
+            return ep_str.upper() in str(cur_ep).upper()
+        elif target_date:
+            return cur_date == target_date and has_ep_num
+        return False
+
+    # ── 確認表 ──
     try:
         confirm      = get_confirm_sheet(wb)
         confirm_rows = confirm.get_all_values()
@@ -375,17 +391,15 @@ def delete_ep_from_sheets(show_name, ep_num=None, date_str=None):
             row_date = str(row[0]).strip()
             show_match = (show_name.lower() in row_show.lower() or row_show.lower() in show_name.lower())
             if not show_match: continue
-            hit = (ep_str and ep_str.upper() in row_ep.upper()) or \
-                  (target_date and row_date == target_date and re.search(r'EP\d', row_ep))
-            if hit:
+            if is_hit(row_ep, row_date):
                 confirm.update_cell(i + 1, 5, "EP")
                 confirm_del.append(f"{row_date} {row_show} {row_ep}")
         if confirm_del:
-            results.append(f"🗑 確認表：{', '.join(confirm_del)}")
+            results.append(f"\U0001f5d1\ufe0f 確認表：{', '.join(confirm_del)}")
     except Exception as e:
-        results.append(f"⚠️ 確認表：{e}")
+        results.append(f"\u26a0\ufe0f 確認表：{e}")
 
-    # 月排程表
+    # ── 月排程表 ──
     try:
         month_ws = get_month_schedule_sheet(wb)
         if month_ws:
@@ -395,23 +409,22 @@ def delete_ep_from_sheets(show_name, ep_num=None, date_str=None):
                 month_del = []
                 for i, row in enumerate(month_ws.get_all_values()):
                     if len(row) < show_col: continue
-                    rd = row[2] if len(row) > 2 else ""
-                    dm = re.search(r'(\d+)/(\d+)', str(rd))
+                    rd = str(row[2]).strip() if len(row) > 2 else ""
+                    dm = re.search(r'(\d{1,2})/(\d{1,2})', rd)
                     cell_date = f"{int(dm.group(1))}/{int(dm.group(2))}" if dm else ""
+                    if not cell_date: continue
                     cur = str(row[show_col - 1]).strip()
-                    hit = (ep_str and ep_str.upper() in cur.upper()) or \
-                          (target_date and cell_date == target_date and re.search(r'EP\d', cur))
-                    if hit:
+                    if is_hit(cur, cell_date):
                         prefix  = re.sub(r'\s*EP\d+.*$', '', cur).strip()
                         month_ws.update_cell(i + 1, show_col, f"{prefix} EP".strip())
                         month_del.append(f"{cell_date} {cur}")
                 if month_del:
                     month = datetime.datetime.now(TZ).month
-                    results.append(f"🗑 {month:02d}月排程表：{', '.join(month_del)}")
+                    results.append(f"\U0001f5d1\ufe0f {month:02d}\u6708\u6392\u7a0b\u8868\uff1a{', '.join(month_del)}")
     except Exception as e:
-        results.append(f"⚠️ 月排程表：{e}")
+        results.append(f"\u26a0\ufe0f \u6708\u6392\u7a0b\u8868\uff1a{e}")
 
-    # 所有IP排程表
+    # ── 所有IP排程表 ──
     try:
         allip = get_allip_sheet(wb)
         if allip:
@@ -420,26 +433,26 @@ def delete_ep_from_sheets(show_name, ep_num=None, date_str=None):
             show_col = next((col for name, col in col_map.items()
                             if show_name.lower() in name.lower() or name.lower() in show_name.lower()), None)
             if show_col:
-                date_col  = 3 if month == 3 else 15
+                date_col  = 15 if month == 4 else 3
                 allip_del = []
                 for i, row in enumerate(allip.get_all_values()):
                     if len(row) < date_col or show_col - 1 >= len(row): continue
-                    rd = row[date_col - 1]
-                    dm = re.search(r'(\d+)/(\d+)', str(rd))
+                    rd = str(row[date_col - 1]).strip() if row[date_col - 1] else ""
+                    dm = re.search(r'(\d{1,2})/(\d{1,2})', rd)
                     cell_date = f"{int(dm.group(1))}/{int(dm.group(2))}" if dm else ""
-                    cur = str(row[show_col - 1]).strip()
-                    hit = (ep_str and ep_str.upper() in cur.upper()) or \
-                          (target_date and cell_date == target_date and re.search(r'EP\d', cur))
-                    if hit:
+                    if not cell_date: continue
+                    cur = str(row[show_col - 1]).strip() if row[show_col - 1] else ""
+                    if not cur: continue
+                    if is_hit(cur, cell_date):
                         prefix = re.sub(r'\s*EP\d+.*$', '', cur).strip()
                         allip.update_cell(i + 1, show_col, f"{prefix} EP".strip())
                         allip_del.append(f"{cell_date} {cur}")
                 if allip_del:
-                    results.append(f"🗑 所有IP排程表：{', '.join(allip_del)}")
+                    results.append(f"\U0001f5d1\ufe0f \u6240\u6709IP\u6392\u7a0b\u8868\uff1a{', '.join(allip_del)}")
     except Exception as e:
-        results.append(f"⚠️ 所有IP排程表：{e}")
+        results.append(f"\u26a0\ufe0f \u6240\u6709IP\u6392\u7a0b\u8868\uff1a{e}")
 
-    # 今日快速確認
+    # ── 今日快速確認 ──
     try:
         quick = get_quick_confirm_sheet(wb)
         if quick:
@@ -450,17 +463,19 @@ def delete_ep_from_sheets(show_name, ep_num=None, date_str=None):
                 row_ep   = str(row[2]).strip()
                 show_match = (show_name.lower() in row_show.lower() or row_show.lower() in show_name.lower())
                 if not show_match: continue
-                hit = (ep_str and ep_str.upper() in row_ep.upper()) or \
-                      (target_date and re.search(r'EP\d', row_ep))
+                hit = bool(ep_str and ep_str.upper() in row_ep.upper())
+                if not hit and not ep_str:
+                    hit = bool(re.search(r'EP\d', row_ep))
                 if hit:
                     quick.update_cell(i + 1, 3, "EP")
                     quick_del.append(f"{row[0]} {row_show} {row_ep}")
             if quick_del:
-                results.append(f"🗑 今日快速確認：{', '.join(quick_del)}")
+                results.append(f"\U0001f5d1\ufe0f \u4eca\u65e5\u5feb\u901f\u78ba\u8a8d\uff1a{', '.join(quick_del)}")
     except Exception as e:
-        results.append(f"⚠️ 今日快速確認：{e}")
+        results.append(f"\u26a0\ufe0f \u4eca\u65e5\u5feb\u901f\u78ba\u8a8d\uff1a{e}")
 
     return results
+
 
 # ── 快取 ──────────────────────────────────────
 _cache = {"date": None, "rows": []}
