@@ -16,7 +16,7 @@ app = Flask(__name__)
 
 LINE_TOKEN   = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 LINE_SECRET  = os.environ["LINE_CHANNEL_SECRET"]
-SHEET_ID     = "1pKm2MHPNoPOvWEv-y-YqUBQ3an-lVraGlKFv3cci1q8"
+SHEET_ID     = "1pKm2MHPNoPOvWEv-y-YqUBQ3an-IVraGlKFv3cci1q8"
 USER_ID      = os.environ["LINE_USER_ID"]
 GSHEET_CREDS = os.environ["GOOGLE_CREDS_JSON"]
 TZ           = pytz.timezone("Asia/Taipei")
