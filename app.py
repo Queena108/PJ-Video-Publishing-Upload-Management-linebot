@@ -1,4 +1,5 @@
-import os, json, datetime, re
+import os, json, datetime, re, calendar
+from collections import defaultdict
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -38,32 +39,166 @@ SHOW_ALIASES = {
     "蟎人": "蟎人",
     "aida": "AIDA", "AIDA": "AIDA",
     "mico": "MICO", "MICO": "MICO",
-    "真心話長": "真心話長", "真心話短": "真心話短", "真心話": "真心話短",
+    "真心話長": "真心話長", "真心話短": "真心話短",
     "芯芯": "芯芯",
     "而璽": "而璽", "而璽設計": "而璽",
     "今晚": "今晚", "今晚長": "今晚長", "今晚短": "今晚短",
 }
 
-# ── 節目→排程表欄位對應 ──
-# 4月排程表 & 所有IP的3月區塊（col 4-11）
-SHOW_COL_BASE = {
-    "董律師": 4, "蟎人": 5, "AIDA": 6, "MICO": 7,
-    "真心話短": 8, "真心話長": 8, "芯芯": 9, "而璽": 10, "今晚": 11,
+# ── 節目完整元資料（平台、時段、LINE 縮寫）──
+SHOW_META = {
+    "董律師": {"slot": "1500", "prefix": "董律",    "platforms": ["FB", "IG", "TK"]},
+    "蟎人":   {"slot": "1800", "prefix": "蟎人",    "platforms": ["FB", "IG", "TK"]},
+    "AIDA":   {"slot": "2000", "prefix": "AIDA",   "platforms": ["FB", "IG", "TK"]},
+    "MICO":   {"slot": "2000", "prefix": "MICO",   "platforms": ["IG", "FB", "YT", "TK"]},
+    "真心話長": {"slot": "2100", "prefix": "真心話長", "platforms": ["YT", "IG", "限動"]},
+    "真心話短": {"slot": "2100", "prefix": "真心話短", "platforms": ["FB", "IG", "YT", "TK", "限動"]},
+    "芯芯":   {"slot": "2100", "prefix": "芯芯",    "platforms": ["IG", "FB", "TK", "YT"]},
+    "而璽":   {"slot": "2100", "prefix": "而璽",    "platforms": ["IG", "FB", "TK"]},
+    "今晚":   {"slot": "2100", "prefix": "今晚",    "platforms": ["IG", "FB", "YT", "TK"]},
 }
-# 所有IP 4月區塊（+12）
-SHOW_COL_APR_ALLIP = {k: v+12 for k, v in SHOW_COL_BASE.items()}
 
-# 節目在排程表裡的顯示前綴（縮寫）
-SHOW_PREFIX = {
-    "董律師": "董律", "蟎人": "蟎人", "AIDA": "AIDA", "MICO": "MICO",
-    "真心話短": "真心話短", "真心話長": "真心話長",
-    "芯芯": "芯芯", "而璽": "而璽", "今晚": "今晚",
+WEEKDAY_ZH = ["(一)", "(二)", "(三)", "(四)", "(五)", "(六)", "(日)"]
+
+# ── 歧義節目清單 ──
+AMBIGUOUS_SHOWS = {
+    "真心話": ["真心話短", "真心話長"],
+    "今晚":   ["今晚短",  "今晚長"],
 }
+
+# ════════════════════════════════════════════
+#  動態月份索引（核心：從表頭動態解析欄位）
+# ════════════════════════════════════════════
+_month_index_cache = {"ts": None, "data": {}}
+
+def build_allip_month_index(rows):
+    """
+    掃描 所有IP上片排程表，動態建立月份→欄位對應：
+    {
+      month_int: {
+        "weekday_col": int,  # gspread 1-indexed 星期欄
+        "date_col":    int,  # gspread 1-indexed 日期欄
+        "show_cols":  {show_name: gspread_col_int}
+      }
+    }
+    從此不再 hardcode month==4 或固定 offset。
+    """
+    result = {}
+    if len(rows) < 4:
+        return result
+
+    row1 = rows[1]  # 月份起始日期行
+    row2 = rows[2]  # 節目標頭行（主）
+    row3 = rows[3]  # 節目標頭行（副，真心話短）
+
+    # Step 1：找各月 block 的星期欄（0-indexed）
+    month_starts = {}  # month_num → weekday_col (0-indexed)
+    for ci, val in enumerate(row1):
+        s = str(val).strip()
+        if not s or s in ("nan", "NaT", "None", ""):
+            continue
+        m = re.search(r'\d{4}-(\d{2})-\d{2}', s)
+        if m:
+            month_num = int(m.group(1))
+            month_starts[month_num] = ci  # 0-indexed Python list position
+
+    for month_num, wday_ci in month_starts.items():
+        result[month_num] = {
+            "weekday_col": wday_ci + 1,   # gspread 1-indexed
+            "date_col":    wday_ci + 2,   # gspread 1-indexed
+            "show_cols":   {}
+        }
+
+    # Step 2：掃描 row2 + row3 找節目標頭
+    # 「屬於哪個月」= 最後一個 weekday_col < 當前欄 的月份
+    sorted_months = sorted(month_starts.items(), key=lambda x: x[1])
+
+    def owning_month(ci):
+        best = None
+        for mn, wday_ci in sorted_months:
+            if ci > wday_ci:
+                best = mn
+        return best
+
+    for row_data in [row2, row3]:
+        for ci, val in enumerate(row_data):
+            s = str(val).strip()
+            if not s or s in ("nan", "NaT", "None", ""):
+                continue
+            for show_name in SHOW_META.keys():
+                if show_name in s:
+                    mn = owning_month(ci)
+                    if mn is not None:
+                        # 同一 show+month 只記錄一次（row2 優先）
+                        if show_name not in result[mn]["show_cols"]:
+                            result[mn]["show_cols"][show_name] = ci + 1  # gspread 1-indexed
+                    break
+
+    return result
+
+
+def get_month_index(allip_rows=None):
+    """快取版本，30 分鐘內不重新掃描"""
+    now = datetime.datetime.now(TZ)
+    cached_ts = _month_index_cache.get("ts")
+    if cached_ts is None or (now - cached_ts).seconds > 1800:
+        if allip_rows is None:
+            allip = get_allip_sheet()
+            allip_rows = allip.get_all_values()
+        _month_index_cache["data"] = build_allip_month_index(allip_rows)
+        _month_index_cache["ts"]   = now
+    return _month_index_cache["data"]
+
+
+def bust_month_index():
+    _month_index_cache["ts"] = None
+
+
+def get_show_col_for_month(month_num, show_name, month_index):
+    """回傳 gspread 1-indexed 欄號；找不到回傳 None"""
+    block = month_index.get(month_num, {})
+    show_cols = block.get("show_cols", {})
+    for name, col in show_cols.items():
+        if show_name.lower() in name.lower() or name.lower() in show_name.lower():
+            return col
+    return None
+
+
+def get_date_col_for_month(month_num, month_index):
+    """回傳 gspread 1-indexed 日期欄號；找不到回傳 None"""
+    block = month_index.get(month_num, {})
+    return block.get("date_col")
+
+
+# ════════════════════════════════════════════
+#  工具函式
+# ════════════════════════════════════════════
+def parse_date_str(raw):
+    """多格式 → M/D 字串；無法解析回傳 None"""
+    raw = raw.strip()
+    m = re.match(r'^(\d{1,2})[/\-](\d{1,2})$', raw)
+    if m:
+        return f"{int(m.group(1))}/{int(m.group(2))}"
+    m = re.match(r'^(\d{1,2})月(\d{1,2})日?$', raw)
+    if m:
+        return f"{int(m.group(1))}/{int(m.group(2))}"
+    return None
+
+
+def parse_cell_date(val):
+    """datetime 物件或字串 → M/D 格式"""
+    if val is None: return ""
+    if hasattr(val, 'month'):
+        return f"{val.month}/{val.day}"
+    s = str(val).strip()
+    dm = re.search(r'(\d{1,2})/(\d{1,2})', s)
+    return f"{int(dm.group(1))}/{int(dm.group(2))}" if dm else ""
+
 
 S_SCHED = "已排程"; S_DONE = "✓ 已上片"
 S_ERR   = "⚠ 不上片"; S_SKIP = "—未排程"
 
-# ── 工具函式 ──────────────────────────────────
+
 def send_reply(reply_token, text):
     with ApiClient(configuration) as api_client:
         MessagingApi(api_client).reply_message(ReplyMessageRequest(
@@ -90,7 +225,6 @@ def get_confirm_sheet(wb=None):
     return wb.worksheet(f"{month:02d}月確認表")
 
 def get_month_schedule_sheet(wb=None):
-    """當月排程表，例如 04月排程表"""
     month = datetime.datetime.now(TZ).month
     wb    = wb or open_workbook()
     try:
@@ -98,16 +232,7 @@ def get_month_schedule_sheet(wb=None):
     except:
         return None
 
-def get_quick_confirm_sheet(wb=None):
-    """今日快速確認表"""
-    wb = wb or open_workbook()
-    try:
-        return wb.worksheet("今日快速確認")
-    except:
-        return None
-
 def get_allip_sheet(wb=None):
-    """所有IP上片排程表"""
     wb = wb or open_workbook()
     try:
         return wb.worksheet("所有IP上片排程表")
@@ -120,6 +245,14 @@ def normalize_show(raw):
         if alias.lower() in raw.lower() or raw.lower() in alias.lower():
             return canonical
     return raw
+
+def get_ambiguous_candidates(raw):
+    raw = raw.strip()
+    for key, candidates in AMBIGUOUS_SHOWS.items():
+        if raw == key:
+            return candidates
+    return None
+
 
 # ── 確認表功能 ────────────────────────────────
 def get_today_rows(sheet=None):
@@ -157,7 +290,7 @@ def build_today_msg(rows):
     lines += ["\n──────────────────",
               "輸入：節目名 EP號 狀態",
               "例：董律師EP177 已排程",
-              "其他：今日 / 狀態 / 全部"]
+              "其他：今日 / 狀態 / 全部 / 查詢"]
     return "\n".join(lines)
 
 def find_confirm_rows(sheet, show_name, ep_num):
@@ -186,24 +319,38 @@ def update_platforms(sheet, row_num, row_data, new_status):
             updates.append(plat)
     return updates
 
-# ── 排程表回寫核心 ────────────────────────────
+def check_existing_schedule(confirm_rows, date_str, show_name):
+    """
+    查確認表，回傳指定日期+節目已有的集數清單（排除空行）。
+    回傳 [] 代表該日期節目尚無排程，可直接新增。
+    """
+    found = []
+    for row in confirm_rows:
+        if len(row) < 5: continue
+        if row[0].strip() != date_str: continue
+        row_show = row[3].strip()
+        row_ep   = row[4].strip()
+        show_match = (show_name.lower() in row_show.lower() or
+                      row_show.lower() in show_name.lower())
+        if show_match and row_show and row_ep:
+            found.append(row_ep)
+    return found
+
+
+# ════════════════════════════════════════════
+#  排程表回寫核心（使用動態欄位索引）
+# ════════════════════════════════════════════
 def write_to_schedule_sheets(show_name, ep_num, date_str=None, action="fill"):
-    """
-    同步回寫到三張工作表：
-    - 確認表：補集數或新增
-    - 月排程表（04月排程表）：找對應日期+節目欄位更新
-    - 所有IP排程表：找對應日期+節目欄位更新
-    action: "fill"=補集數, "add"=新增排程
-    """
-    wb       = open_workbook()
-    new_ep   = f"EP{ep_num}"
-    results  = []
+    wb      = open_workbook()
+    new_ep  = f"EP{ep_num}"
+    results = []
+    month   = datetime.datetime.now(TZ).month
 
     # ── 1. 確認表 ──
     try:
-        confirm = get_confirm_sheet(wb)
+        confirm      = get_confirm_sheet(wb)
         confirm_rows = confirm.get_all_values()
-        confirm_updated = []
+        confirm_upd  = []
         for i, row in enumerate(confirm_rows):
             if len(row) < 5: continue
             row_show = str(row[3]).strip()
@@ -213,170 +360,117 @@ def write_to_schedule_sheets(show_name, ep_num, date_str=None, action="fill"):
                          row_show.lower() in show_name.lower())
             if not show_match: continue
             if action == "fill":
-                # 補集數：只更新沒有數字的 EP 欄
                 if re.match(r'^EP\s*$', row_ep, re.IGNORECASE) or row_ep.upper() == "EP":
                     confirm.update_cell(i + 1, 5, new_ep)
-                    confirm_updated.append(f"{row_date} {row_show}")
+                    confirm_upd.append(f"{row_date} {row_show}")
             elif action == "add" and date_str:
-                # 新增：找指定日期的欄位
-                parts = date_str.split("/")
-                target = f"{int(parts[0])}/{int(parts[1])}" if len(parts) == 2 else date_str
-                if row_date == target:
+                if row_date == date_str:
                     confirm.update_cell(i + 1, 5, new_ep)
-                    confirm_updated.append(f"{row_date} {row_show}")
-        if confirm_updated:
-            results.append(f"✅ 確認表：{', '.join(confirm_updated)}")
+                    confirm_upd.append(f"{row_date} {row_show}")
+        if confirm_upd:
+            results.append(f"✅ 確認表：{', '.join(confirm_upd)}")
     except Exception as e:
         results.append(f"⚠️ 確認表更新失敗：{e}")
 
-    # ── 2. 月排程表（04月排程表）──
+    # ── 2. 月排程表 ──
     try:
         month_ws = get_month_schedule_sheet(wb)
         if month_ws:
-            # 找節目對應欄
-            show_col = None
-            for name, col in SHOW_COL_BASE.items():
-                if show_name.lower() in name.lower() or name.lower() in show_name.lower():
-                    show_col = col
+            show_col    = None
+            month_index = get_month_index()
+            # 月排程表的節目欄：直接比對標頭
+            headers = month_ws.row_values(2)
+            for ci, hdr in enumerate(headers):
+                if show_name.lower() in hdr.lower() or (
+                    normalize_show(hdr).lower() == show_name.lower()
+                ):
+                    show_col = ci + 1  # gspread 1-indexed
                     break
+            if show_col is None:
+                # fallback: 用節目別名比對
+                for ci, hdr in enumerate(headers):
+                    n = normalize_show(hdr)
+                    if n.lower() == show_name.lower():
+                        show_col = ci + 1
+                        break
             if show_col:
                 month_rows = month_ws.get_all_values()
-                month_updated = []
+                month_upd  = []
                 for i, row in enumerate(month_rows):
                     if len(row) < 3: continue
-                    row_date = row[2] if len(row) > 2 else ""
-                    # row[2] is datetime or date string
-                    if not row_date: continue
-                    # parse date
-                    if hasattr(row_date, 'month'):
-                        cell_date = f"{row_date.month}/{row_date.day}"
-                    else:
-                        row_date = str(row_date).strip()
-                        dm = re.search(r'(\d+)/(\d+)', row_date)
-                        cell_date = f"{int(dm.group(1))}/{int(dm.group(2))}" if dm else row_date
-
+                    cell_date = parse_cell_date(row[1] if len(row) > 1 else None)
+                    if not cell_date: continue
                     if action == "fill":
-                        # 補集數：找該節目欄位為空或 EP 無數字
                         if show_col - 1 < len(row):
                             cur = str(row[show_col - 1]).strip()
-                            ep_no_num = re.match(r'^(?:.*\s)?EP\s*$', cur) or (show_name[:2] in cur and "EP" in cur and not re.search(r'EP\d', cur))
-                            if ep_no_num:
-                                # Build new value keeping show prefix
-                                prefix = re.sub(r'EP\s*\d*$', '', cur).strip()
-                                new_val = f"{prefix} {new_ep}".strip() if prefix else new_ep
+                            if cur and "EP" in cur and not re.search(r'EP\d', cur):
+                                prefix  = re.sub(r'EP\s*\d*$', '', cur).strip()
+                                new_val = f"{prefix} {new_ep}".strip()
                                 month_ws.update_cell(i + 1, show_col, new_val)
-                                month_updated.append(cell_date)
+                                month_upd.append(f"{cell_date} → {new_val}")
                     elif action == "add" and date_str:
-                        parts = date_str.split("/")
-                        target = f"{int(parts[0])}/{int(parts[1])}" if len(parts) == 2 else date_str
-                        if cell_date == target:
-                            show_prefix = re.sub(r'\s+', '', show_name[:2])
-                            new_val = f"{show_prefix} {new_ep}"
+                        if cell_date == date_str:
+                            prefix  = SHOW_META.get(show_name, {}).get("prefix", show_name)
+                            new_val = f"{prefix} {new_ep}"
                             month_ws.update_cell(i + 1, show_col, new_val)
-                            month_updated.append(cell_date)
-                if month_updated:
-                    month = datetime.datetime.now(TZ).month
-                    results.append(f"✅ {month:02d}月排程表：{', '.join(month_updated)}")
+                            month_upd.append(f"{cell_date} → {new_val}")
+                if month_upd:
+                    results.append(f"✅ {month:02d}月排程表：{', '.join(month_upd)}")
     except Exception as e:
         results.append(f"⚠️ 月排程表更新失敗：{e}")
 
-    # ── 3. 所有IP上片排程表 ──
+    # ── 3. 所有IP上片排程表（動態欄位）──
     try:
-        allip = get_allip_sheet(wb)
+        allip       = get_allip_sheet(wb)
         if allip:
-            month    = datetime.datetime.now(TZ).month
-            # Determine which col block to use based on current month
-            col_map  = SHOW_COL_APR_ALLIP if month == 4 else SHOW_COL_BASE
-            show_col = None
-            for name, col in col_map.items():
-                if show_name.lower() in name.lower() or name.lower() in show_name.lower():
-                    show_col = col
-                    break
-            if show_col:
-                # date col is show_col_base-2 for that month block
-                date_col = 3 if month == 3 else 15  # col3 for Mar, col15 for Apr
-                allip_rows = allip.get_all_values()
-                allip_updated = []
+            allip_rows  = allip.get_all_values()
+            month_index = get_month_index(allip_rows)
+            show_col    = get_show_col_for_month(month, show_name, month_index)
+            date_col    = get_date_col_for_month(month, month_index)
+            if show_col and date_col:
+                allip_upd = []
                 for i, row in enumerate(allip_rows):
                     if len(row) < date_col: continue
-                    raw_date = row[date_col - 1]
-                    if hasattr(raw_date, 'month'):
-                        cell_date = f"{raw_date.month}/{raw_date.day}"
-                    else:
-                        raw_date = str(raw_date).strip()
-                        dm = re.search(r'(\d+)/(\d+)', raw_date)
-                        cell_date = f"{int(dm.group(1))}/{int(dm.group(2))}" if dm else ""
+                    cell_date = parse_cell_date(row[date_col - 1])
                     if not cell_date: continue
-
                     if action == "fill":
                         if show_col - 1 < len(row):
                             cur = str(row[show_col - 1]).strip()
-                            ep_no_num = "EP" in cur and not re.search(r'EP\d', cur)
-                            if ep_no_num:
-                                prefix = re.sub(r'EP\s*\d*$', '', cur).strip()
-                                new_val = f"{prefix} {new_ep}".strip() if prefix else new_ep
+                            if cur and "EP" in cur and not re.search(r'EP\d', cur):
+                                prefix  = re.sub(r'EP\s*\d*$', '', cur).strip()
+                                new_val = f"{prefix} {new_ep}".strip()
                                 allip.update_cell(i + 1, show_col, new_val)
-                                allip_updated.append(cell_date)
+                                allip_upd.append(cell_date)
                     elif action == "add" and date_str:
-                        parts = date_str.split("/")
-                        target = f"{int(parts[0])}/{int(parts[1])}" if len(parts) == 2 else date_str
-                        if cell_date == target:
-                            show_prefix = re.sub(r'\s+', '', show_name[:2])
-                            new_val = f"{show_prefix} {new_ep}"
+                        if cell_date == date_str:
+                            prefix  = SHOW_META.get(show_name, {}).get("prefix", show_name[:2])
+                            new_val = f"{prefix} {new_ep}"
                             allip.update_cell(i + 1, show_col, new_val)
-                            allip_updated.append(cell_date)
-                if allip_updated:
-                    results.append(f"✅ 所有IP排程表：{', '.join(allip_updated)}")
+                            allip_upd.append(cell_date)
+                if allip_upd:
+                    results.append(f"✅ 所有IP排程表：{', '.join(allip_upd)}")
+            elif show_col is None:
+                results.append(f"⚠️ 所有IP排程表：找不到 {month}月 {show_name} 的欄位（表頭尚未新增？）")
     except Exception as e:
         results.append(f"⚠️ 所有IP排程表更新失敗：{e}")
 
-    # ── 4. 今日快速確認 ──
-    try:
-        quick = get_quick_confirm_sheet(wb)
-        if quick:
-            quick_rows    = quick.get_all_values()
-            quick_updated = []
-            for i, row in enumerate(quick_rows):
-                if len(row) < 3 or i < 4: continue  # skip headers
-                row_show = str(row[1]).strip()   # B欄 = 節目
-                row_ep   = str(row[2]).strip()   # C欄 = 集數
-                show_match = (show_name.lower() in row_show.lower() or
-                             row_show.lower() in show_name.lower())
-                if not show_match: continue
-                if action == "fill":
-                    if re.match(r'^EP\s*$', row_ep, re.IGNORECASE) or row_ep.upper() == "EP":
-                        quick.update_cell(i + 1, 3, new_ep)
-                        quick_updated.append(f"{row[0]} {row_show}")
-                elif action == "add" and date_str:
-                    # 今日快速確認沒有日期欄，用節目+EP空白判斷
-                    if re.match(r'^EP\s*$', row_ep, re.IGNORECASE) or row_ep.upper() == "EP":
-                        quick.update_cell(i + 1, 3, new_ep)
-                        quick_updated.append(f"{row[0]} {row_show}")
-            if quick_updated:
-                results.append(f"✅ 今日快速確認：{', '.join(quick_updated)}")
-    except Exception as e:
-        results.append(f"⚠️ 今日快速確認更新失敗：{e}")
-
     return results
+
+
 def delete_ep_from_sheets(show_name, ep_num=None, date_str=None):
     wb      = open_workbook()
     results = []
-    target_date = None
-    if date_str:
-        parts = date_str.split("/")
-        if len(parts) == 2:
-            try: target_date = f"{int(parts[0])}/{int(parts[1])}"
-            except: pass
-    ep_str = f"EP{ep_num}" if ep_num else None
+    month   = datetime.datetime.now(TZ).month
+    ep_str  = f"EP{ep_num}" if ep_num else None
 
     def is_hit(cur_ep, cur_date):
         has_ep_num = bool(re.search(r'EP\d', str(cur_ep)))
-        if ep_str and target_date:
-            return ep_str.upper() in str(cur_ep).upper() and cur_date == target_date
+        if ep_str and date_str:
+            return ep_str.upper() in str(cur_ep).upper() and cur_date == date_str
         elif ep_str:
             return ep_str.upper() in str(cur_ep).upper()
-        elif target_date:
-            return cur_date == target_date and has_ep_num
+        elif date_str:
+            return cur_date == date_str and has_ep_num
         return False
 
     # ── 確認表 ──
@@ -395,51 +489,50 @@ def delete_ep_from_sheets(show_name, ep_num=None, date_str=None):
                 confirm.update_cell(i + 1, 5, "EP")
                 confirm_del.append(f"{row_date} {row_show} {row_ep}")
         if confirm_del:
-            results.append(f"\U0001f5d1\ufe0f 確認表：{', '.join(confirm_del)}")
+            results.append(f"🗑️ 確認表：{', '.join(confirm_del)}")
     except Exception as e:
-        results.append(f"\u26a0\ufe0f 確認表：{e}")
+        results.append(f"⚠️ 確認表：{e}")
 
     # ── 月排程表 ──
     try:
         month_ws = get_month_schedule_sheet(wb)
         if month_ws:
-            show_col = next((col for name, col in SHOW_COL_BASE.items()
-                            if show_name.lower() in name.lower() or name.lower() in show_name.lower()), None)
+            headers  = month_ws.row_values(2)
+            show_col = None
+            for ci, hdr in enumerate(headers):
+                if show_name.lower() in hdr.lower() or normalize_show(hdr).lower() == show_name.lower():
+                    show_col = ci + 1
+                    break
             if show_col:
                 month_del = []
                 for i, row in enumerate(month_ws.get_all_values()):
                     if len(row) < show_col: continue
-                    rd = str(row[2]).strip() if len(row) > 2 else ""
-                    dm = re.search(r'(\d{1,2})/(\d{1,2})', rd)
-                    cell_date = f"{int(dm.group(1))}/{int(dm.group(2))}" if dm else ""
+                    cell_date = parse_cell_date(row[1] if len(row) > 1 else None)
                     if not cell_date: continue
-                    cur = str(row[show_col - 1]).strip()
+                    cur = str(row[show_col - 1]).strip() if row[show_col - 1] else ""
+                    if not cur: continue
                     if is_hit(cur, cell_date):
-                        prefix  = re.sub(r'\s*EP\d+.*$', '', cur).strip()
+                        prefix = re.sub(r'\s*EP\d+.*$', '', cur).strip()
                         month_ws.update_cell(i + 1, show_col, f"{prefix} EP".strip())
                         month_del.append(f"{cell_date} {cur}")
                 if month_del:
-                    month = datetime.datetime.now(TZ).month
-                    results.append(f"\U0001f5d1\ufe0f {month:02d}\u6708\u6392\u7a0b\u8868\uff1a{', '.join(month_del)}")
+                    results.append(f"🗑️ {month:02d}月排程表：{', '.join(month_del)}")
     except Exception as e:
-        results.append(f"\u26a0\ufe0f \u6708\u6392\u7a0b\u8868\uff1a{e}")
+        results.append(f"⚠️ 月排程表：{e}")
 
-    # ── 所有IP排程表 ──
+    # ── 所有IP排程表（動態欄位）──
     try:
         allip = get_allip_sheet(wb)
         if allip:
-            month    = datetime.datetime.now(TZ).month
-            col_map  = SHOW_COL_APR_ALLIP if month == 4 else SHOW_COL_BASE
-            show_col = next((col for name, col in col_map.items()
-                            if show_name.lower() in name.lower() or name.lower() in show_name.lower()), None)
-            if show_col:
-                date_col  = 15 if month == 4 else 3
+            allip_rows  = allip.get_all_values()
+            month_index = get_month_index(allip_rows)
+            show_col    = get_show_col_for_month(month, show_name, month_index)
+            date_col    = get_date_col_for_month(month, month_index)
+            if show_col and date_col:
                 allip_del = []
-                for i, row in enumerate(allip.get_all_values()):
+                for i, row in enumerate(allip_rows):
                     if len(row) < date_col or show_col - 1 >= len(row): continue
-                    rd = str(row[date_col - 1]).strip() if row[date_col - 1] else ""
-                    dm = re.search(r'(\d{1,2})/(\d{1,2})', rd)
-                    cell_date = f"{int(dm.group(1))}/{int(dm.group(2))}" if dm else ""
+                    cell_date = parse_cell_date(row[date_col - 1])
                     if not cell_date: continue
                     cur = str(row[show_col - 1]).strip() if row[show_col - 1] else ""
                     if not cur: continue
@@ -448,40 +541,233 @@ def delete_ep_from_sheets(show_name, ep_num=None, date_str=None):
                         allip.update_cell(i + 1, show_col, f"{prefix} EP".strip())
                         allip_del.append(f"{cell_date} {cur}")
                 if allip_del:
-                    results.append(f"\U0001f5d1\ufe0f \u6240\u6709IP\u6392\u7a0b\u8868\uff1a{', '.join(allip_del)}")
+                    results.append(f"🗑️ 所有IP排程表：{', '.join(allip_del)}")
     except Exception as e:
-        results.append(f"\u26a0\ufe0f \u6240\u6709IP\u6392\u7a0b\u8868\uff1a{e}")
-
-    # ── 今日快速確認 ──
-    try:
-        quick = get_quick_confirm_sheet(wb)
-        if quick:
-            quick_del = []
-            for i, row in enumerate(quick.get_all_values()):
-                if len(row) < 3 or i < 4: continue
-                row_show = str(row[1]).strip()
-                row_ep   = str(row[2]).strip()
-                show_match = (show_name.lower() in row_show.lower() or row_show.lower() in show_name.lower())
-                if not show_match: continue
-                hit = bool(ep_str and ep_str.upper() in row_ep.upper())
-                if not hit and not ep_str:
-                    hit = bool(re.search(r'EP\d', row_ep))
-                if hit:
-                    quick.update_cell(i + 1, 3, "EP")
-                    quick_del.append(f"{row[0]} {row_show} {row_ep}")
-            if quick_del:
-                results.append(f"\U0001f5d1\ufe0f \u4eca\u65e5\u5feb\u901f\u78ba\u8a8d\uff1a{', '.join(quick_del)}")
-    except Exception as e:
-        results.append(f"\u26a0\ufe0f \u4eca\u65e5\u5feb\u901f\u78ba\u8a8d\uff1a{e}")
+        results.append(f"⚠️ 所有IP排程表：{e}")
 
     return results
 
 
-# ── 快取 ──────────────────────────────────────
-_cache = {"date": None, "rows": []}
+# ════════════════════════════════════════════
+#  自動建立月份表單（核心新功能）
+#  從所有IP上片排程表讀取指定月份，
+#  自動生成 XX月排程表 + XX月確認表
+# ════════════════════════════════════════════
+def _build_line_format(date_str, slot, show_name, ep_value, status):
+    """組合 LINE 回報格式字串"""
+    parts    = date_str.split("/")
+    date_fmt = f"{int(parts[0]):02d}/{int(parts[1]):02d}"
+    platforms = SHOW_META.get(show_name, {}).get("platforms", [])
+    plat_str  = " ".join(f"✓{p}" for p in platforms)
+    return f"[{date_fmt} {slot}] {show_name} {ep_value} {plat_str} {status}"
 
-# 對話暫存：記住待確認日期的指令
-# 格式：{"show_name": "董律師", "ep_num": "178", "status": "已排程"}
+
+def create_month_sheets(month_num, force=False):
+    """
+    讀取 所有IP上片排程表 中指定月份的資料，
+    自動建立 XX月排程表 和 XX月確認表。
+    force=True 時覆蓋已存在的工作表。
+    """
+    wb = open_workbook()
+
+    # ── Step 1：讀取 所有IP表 並建立動態索引 ──
+    allip      = get_allip_sheet(wb)
+    allip_rows = allip.get_all_values()
+    bust_month_index()  # 強制重建快取
+    month_index = get_month_index(allip_rows)
+
+    if month_num not in month_index:
+        available = sorted(month_index.keys())
+        return False, (
+            f"⚠️ 所有IP上片排程表 裡找不到 {month_num}月 的資料。\n"
+            f"目前有資料的月份：{available}\n"
+            f"請先在 所有IP排程表 新增 {month_num}月 的欄位後再試。"
+        )
+
+    block    = month_index[month_num]
+    date_col = block["date_col"]      # gspread 1-indexed
+    shows    = block["show_cols"]     # {show_name: gspread_1idx_col}
+
+    if not shows:
+        return False, f"⚠️ {month_num}月 的節目欄位為空，請確認所有IP排程表的表頭是否正確。"
+
+    # ── Step 2：從 所有IP表 抽取該月所有排程資料 ──
+    entries = []   # [{date, weekday, show, ep}]
+    for row_idx, row in enumerate(allip_rows):
+        if row_idx < 6:  # 跳過標頭行
+            continue
+        if len(row) < date_col:
+            continue
+        date_raw  = row[date_col - 1]
+        cell_date = parse_cell_date(date_raw)
+        if not cell_date:
+            continue
+        # 只保留當月的資料
+        try:
+            mo = int(cell_date.split("/")[0])
+        except:
+            continue
+        if mo != month_num:
+            continue
+
+        weekday = row[block["weekday_col"] - 1] if len(row) >= block["weekday_col"] else ""
+        for show_name, show_col in shows.items():
+            if show_col - 1 < len(row) and row[show_col - 1]:
+                ep_val = str(row[show_col - 1]).strip()
+                if ep_val:
+                    entries.append({
+                        "date":    cell_date,
+                        "weekday": weekday,
+                        "show":    show_name,
+                        "ep":      ep_val,
+                    })
+
+    if not entries:
+        return False, f"⚠️ 所有IP排程表 中 {month_num}月 沒有任何排程資料。"
+
+    results     = []
+    year        = 2026  # 可擴展為動態取年份
+    sched_name  = f"{month_num:02d}月排程表"
+    confirm_name= f"{month_num:02d}月確認表"
+
+    # 已存在的工作表
+    existing_sheets = [ws.title for ws in wb.worksheets()]
+    if not force:
+        conflicts = [n for n in [sched_name, confirm_name] if n in existing_sheets]
+        if conflicts:
+            return False, (
+                f"⚠️ 以下表單已存在：{', '.join(conflicts)}\n"
+                f"若要覆蓋請輸入：建立{month_num}月表單 覆蓋"
+            )
+
+    # ── Step 3：建立 XX月排程表 ──
+    try:
+        if sched_name in existing_sheets:
+            wb.del_worksheet(wb.worksheet(sched_name))
+
+        ws_sched = wb.add_worksheet(title=sched_name, rows=50, cols=12)
+
+        # 節目欄位按時段排序
+        show_order = sorted(shows.keys(),
+                            key=lambda s: (SHOW_META.get(s, {}).get("slot", "9999"), s))
+
+        # 組合欄位標頭
+        col_headers = ["星期", "日期"]
+        for show in show_order:
+            meta   = SHOW_META.get(show, {})
+            slot   = meta.get("slot", "")
+            plats  = "  ".join(meta.get("platforms", []))
+            col_headers.append(f"{slot} {show}\n({plats})")
+
+        ws_sched.update("A1", [[f"{year}年 {month_num:02d}月 上片排程表"]])
+        ws_sched.update("A2", [col_headers])
+
+        # 依日期聚合資料
+        date_data = {}
+        for e in entries:
+            d = e["date"]
+            if d not in date_data:
+                date_data[d] = {"weekday": e["weekday"], "shows": {}}
+            date_data[d]["shows"][e["show"]] = e["ep"]
+
+        # 填入當月每一天（含空白天）
+        first_day = datetime.date(year, month_num, 1)
+        last_day  = datetime.date(year, month_num,
+                                  calendar.monthrange(year, month_num)[1])
+        data_rows = []
+        cur = first_day
+        while cur <= last_day:
+            ds  = f"{cur.month}/{cur.day}"
+            wd  = WEEKDAY_ZH[cur.weekday()]
+            row_vals = [wd, ds]
+            if ds in date_data:
+                for show in show_order:
+                    row_vals.append(date_data[ds]["shows"].get(show, ""))
+            else:
+                row_vals += [""] * len(show_order)
+            data_rows.append(row_vals)
+            cur += datetime.timedelta(days=1)
+
+        ws_sched.update("A3", data_rows)
+        filled = sum(1 for r in data_rows if any(v for v in r[2:]))
+        results.append(f"✅ {sched_name}：建立完成（{filled} 天有排程）")
+    except Exception as e:
+        results.append(f"⚠️ {sched_name} 建立失敗：{e}")
+
+    # ── Step 4：建立 XX月確認表 ──
+    try:
+        if confirm_name in existing_sheets:
+            wb.del_worksheet(wb.worksheet(confirm_name))
+
+        ws_confirm = wb.add_worksheet(title=confirm_name, rows=100, cols=12)
+        ws_confirm.update("A1", [[f"{year}年 {month_num:02d}月 上片確認表"]])
+        ws_confirm.update("A2", [["日期", "星期", "時段", "節目", "影片集數",
+                                   "IG/FB", "TK", "YT", "限動", "全部完成?",
+                                   "LINE 回報格式"]])
+
+        # 依日期分組，並按時段排序
+        date_entries = defaultdict(list)
+        for e in entries:
+            date_entries[e["date"]].append(e)
+
+        sorted_dates = sorted(
+            date_entries.keys(),
+            key=lambda x: (int(x.split("/")[0]), int(x.split("/")[1]))
+        )
+
+        confirm_data = []
+        for ds in sorted_dates:
+            day_entries = date_entries[ds]
+            mo, dy = int(ds.split("/")[0]), int(ds.split("/")[1])
+            date_obj = datetime.date(year, mo, dy)
+            wd       = WEEKDAY_ZH[date_obj.weekday()]
+            wd_char  = wd.strip("()")
+            # 日期標頭行（合併提示用）
+            confirm_data.append([f"  {year}/{mo:02d}/{dy:02d}（{wd_char}）",
+                                  "", "", "", "", "", "", "", "", "", ""])
+
+            # 依時段排序
+            day_entries.sort(key=lambda e: (SHOW_META.get(e["show"], {}).get("slot", "9999"),
+                                            e["show"]))
+
+            for e in day_entries:
+                show_name = e["show"]
+                ep_val    = e["ep"]
+                meta      = SHOW_META.get(show_name, {})
+                slot      = meta.get("slot", "")
+                platforms = meta.get("platforms", [])
+
+                has_num     = bool(re.search(r'EP\d', ep_val))
+                init_status = "已排程" if has_num else "—未排程"
+
+                # 各平台初始狀態
+                has = lambda p: p in platforms
+                ig_fb = init_status if has("IG") or has("FB") else "—未排程"
+                tk    = init_status if has("TK")              else "—未排程"
+                yt    = init_status if has("YT")              else "—未排程"
+                xian  = init_status if has("限動")            else "—未排程"
+
+                all_done  = init_status
+                line_fmt  = _build_line_format(ds, slot, show_name, ep_val, init_status)
+
+                confirm_data.append([
+                    ds, wd, slot, show_name, ep_val,
+                    ig_fb, tk, yt, xian, all_done, line_fmt
+                ])
+
+        ws_confirm.update("A3", confirm_data)
+        n_rows = sum(1 for r in confirm_data if r[3])  # 有節目名稱的行
+        results.append(f"✅ {confirm_name}：建立完成（{n_rows} 筆排程）")
+    except Exception as e:
+        results.append(f"⚠️ {confirm_name} 建立失敗：{e}")
+
+    bust_month_index()
+    summary = f"🗓 {month_num}月表單建立完成！\n\n" + "\n".join(results)
+    return True, summary
+
+
+# ── 快取 ──────────────────────────────────────
+_cache   = {"date": None, "rows": []}
 _pending = {}
 
 def cached_rows():
@@ -505,7 +791,10 @@ sched = BackgroundScheduler(timezone=TZ)
 sched.add_job(push_daily, "cron", hour=8, minute=0)
 sched.start()
 
-# ── Webhook ───────────────────────────────────
+
+# ════════════════════════════════════════════
+#  Webhook
+# ════════════════════════════════════════════
 @app.route("/callback", methods=["POST"])
 def callback():
     sig  = request.headers.get("X-Line-Signature","")
@@ -543,9 +832,35 @@ def on_msg(event):
         bust()
         send_reply(token, f"✅ 今日 {count} 個節目全部標記已上片！"); return
 
+    # ── 取消 pending ──
+    if text in ("取消", "cancel", "退出"):
+        if USER_ID in _pending:
+            op = _pending.pop(USER_ID)
+            send_reply(token, f"✅ 已取消操作（{op.get('show_name','')}）")
+        else:
+            send_reply(token, "目前沒有待確認的操作")
+        return
+
     # ══════════════════════════════════════════
-    # 補集數：同步更新三張表
-    # 格式：補集數 董律師 EP178
+    # 建立月份表單（新功能）
+    # 格式：建立5月表單  /  建立05月表單  /  建立5月表單 覆蓋
+    # ══════════════════════════════════════════
+    create_m = re.match(r'^建立\s*(\d{1,2})\s*月表單(.*)$', text)
+    if create_m:
+        month_num = int(create_m.group(1))
+        force     = "覆蓋" in create_m.group(2)
+        if month_num < 1 or month_num > 12:
+            send_reply(token, "月份輸入錯誤，請輸入 1-12"); return
+        send_reply(token, f"⏳ 正在從 所有IP上片排程表 讀取 {month_num}月 資料，建立表單中，請稍候...")
+        try:
+            ok, msg = create_month_sheets(month_num, force=force)
+        except Exception as e:
+            send_reply(token, f"建立失敗：{e}"); return
+        bust()
+        send_reply(token, msg); return
+
+    # ══════════════════════════════════════════
+    # 補集數
     # ══════════════════════════════════════════
     if re.match(r'^(補集數|補ep|補EP)', text):
         remaining = re.sub(r'^(補集數|補[Ee][Pp])\s*', '', text).strip()
@@ -553,96 +868,157 @@ def on_msg(event):
         ep_num    = ep_match.group(1) if ep_match else None
         show_raw  = re.sub(r'EP?\s*\d+', '', remaining, flags=re.IGNORECASE).strip()
         show_name = normalize_show(show_raw)
-
         if not show_name or not ep_num:
             send_reply(token, "格式：補集數 節目名 EP號\n例：補集數 董律師 EP178"); return
-
-        send_reply(token, f"⏳ 正在同步更新三張表，請稍候...")
+        send_reply(token, f"⏳ 正在同步更新，請稍候...")
         try:
             results = write_to_schedule_sheets(show_name, ep_num, action="fill")
         except Exception as e:
             send_reply(token, f"更新失敗：{e}"); return
-
         bust()
         msg = f"✅ 補集數完成 {show_name} EP{ep_num}\n\n" + "\n".join(results) if results else f"找不到 {show_name} 需要補集數的欄位"
         send_reply(token, msg); return
 
     # ══════════════════════════════════════════
-    # 新增排程：同步更新三張表
-    # 格式：新增 董律師 EP178 4/10 1500
+    # 新增排程（兩步流程）
     # ══════════════════════════════════════════
     if re.match(r'^(新增|更新排程|加排程)', text):
         remaining  = re.sub(r'^(新增|更新排程|加排程)\s*', '', text).strip()
         ep_match   = re.search(r'EP\s*(\d+)', remaining, re.IGNORECASE)
         ep_num     = ep_match.group(1) if ep_match else None
-        date_match = re.search(r'(\d{1,2})[/月](\d{1,2})', remaining)
-        date_str   = f"{date_match.group(1)}/{date_match.group(2)}" if date_match else None
+        date_match = re.search(r'(\d{1,2})[/\-月](\d{1,2})日?', remaining)
+        date_str   = f"{int(date_match.group(1))}/{int(date_match.group(2))}" if date_match else None
         show_raw   = re.sub(r'EP\s*\d+', '', remaining, flags=re.IGNORECASE)
-        show_raw   = re.sub(r'\d{1,2}[/月]\d{1,2}', '', show_raw)
+        show_raw   = re.sub(r'\d{1,2}[/\-月]\d{1,2}日?', '', show_raw)
         show_raw   = re.sub(r'\b(0900|1200|1500|1800|2000|2100)\b', '', show_raw).strip()
         show_name  = normalize_show(show_raw)
-
-        if not show_name or not ep_num or not date_str:
-            send_reply(token, "格式：新增 節目名 EP號 日期\n例：新增 董律師 EP178 4/10"); return
-
+        if not show_name or not ep_num:
+            send_reply(token, "格式：新增 節目名 EP號\n例：新增 董律師 EP178"); return
+        if not date_str:
+            _pending[USER_ID] = {"action": "add", "show_name": show_name, "ep_num": ep_num}
+            send_reply(token,
+                f"📅 {show_name} EP{ep_num} 要新增到哪一天？\n"
+                f"請輸入日期，例：4/10 或 4月10日\n（輸入「取消」放棄）")
+            return
         send_reply(token, f"⏳ 正在同步更新三張表，請稍候...")
         try:
             results = write_to_schedule_sheets(show_name, ep_num, date_str=date_str, action="add")
         except Exception as e:
             send_reply(token, f"更新失敗：{e}"); return
-
         bust()
-        msg = f"✅ 新增排程完成 {show_name} EP{ep_num} ({date_str})\n\n" + "\n".join(results) if results else f"找不到 {date_str} {show_name} 的對應欄位"
+        msg = f"✅ 新增排程完成 {show_name} EP{ep_num}（{date_str}）\n\n" + "\n".join(results) if results else f"找不到 {date_str} {show_name} 的對應欄位"
         send_reply(token, msg); return
 
-    # ══════════════════════════════════════════
-    # 確認表狀態更新（原有功能）
-    # 例：董律師EP177 已排程
-    # ══════════════════════════════════════════
-    found_status = None
-    found_key    = None
-    for key in sorted(STATUS_MAP.keys(), key=len, reverse=True):
-        if key in text:
-            found_status = STATUS_MAP[key]
-            found_key    = key
-            break
-
-    # ══════════════════════════════════════════
-    # 略過同步
-    if text in ("略過", "skip", "不用", "不需要") and USER_ID in _pending:
+    # ── 略過 ──
+    if text in ("略過", "skip", "不用") and USER_ID in _pending:
         pending   = _pending.pop(USER_ID)
         action    = pending.get("action", "status")
         show_name = pending["show_name"]
-        ep_num    = pending["ep_num"]
+        ep_num    = pending.get("ep_num")
         if action == "delete":
-            try:
-                results = delete_ep_from_sheets(show_name, ep_num=ep_num)
-            except Exception as e:
-                send_reply(token, f"刪除失敗：{e}"); return
-            bust()
-            msg = f"🗑 刪集數完成 {show_name} EP{ep_num}（所有日期）\n\n" + "\n".join(results) if results else f"找不到符合的集數"
-            send_reply(token, msg)
+            # 略過日期過濾 → 刪除所有符合 → 先顯示確認
+            _pending[USER_ID] = {
+                "action":    "delete_confirm",
+                "show_name": show_name,
+                "ep_num":    ep_num,
+                "date_str":  None,
+            }
+            send_reply(token,
+                f"⚠️ 即將刪除所有日期的 {show_name} EP{ep_num}\n"
+                f"此操作不可復原，確定繼續？\n"
+                f"輸入「確認刪除」繼續 / 「取消」放棄")
         else:
-            send_reply(token, "✅ 已略過集數同步，只更新確認表狀態。")
+            send_reply(token, "✅ 已略過集數同步。")
         return
 
-    # 待確認日期回覆
-    date_only = re.match(r'^(\d{1,2})[/月](\d{1,2})$', text.strip())
-    if date_only and USER_ID in _pending:
-        pending   = _pending.pop(USER_ID)
-        show_name = pending["show_name"]
-        ep_num    = pending["ep_num"]
-        action    = pending.get("action", "status")
-        date_str  = f"{date_only.group(1)}/{date_only.group(2)}"
+    # ── 二次確認：確認新增（覆蓋衝突） ──
+    if text in ("確認", "confirm", "覆蓋") and USER_ID in _pending:
+        pending = _pending.get(USER_ID, {})
+        if pending.get("action") == "add_confirm":
+            _pending.pop(USER_ID)
+            show_name = pending["show_name"]
+            ep_num    = pending["ep_num"]
+            date_str  = pending["date_str"]
+            send_reply(token, f"⏳ 正在同步更新三張表，請稍候...")
+            try:
+                results = write_to_schedule_sheets(show_name, ep_num, date_str=date_str, action="add")
+            except Exception as e:
+                send_reply(token, f"更新失敗：{e}"); return
+            bust()
+            msg = f"✅ 新增排程完成 {show_name} EP{ep_num}（{date_str}）\n\n" + "\n".join(results) if results else f"找不到 {date_str} {show_name} 的對應欄位"
+            send_reply(token, msg); return
 
-        if action == "delete":
+    # ── 二次確認：確認刪除 ──
+    if text in ("確認刪除", "確定刪除", "刪除確認") and USER_ID in _pending:
+        pending = _pending.get(USER_ID, {})
+        if pending.get("action") == "delete_confirm":
+            _pending.pop(USER_ID)
+            show_name = pending["show_name"]
+            ep_num    = pending["ep_num"]
+            date_str  = pending.get("date_str")
+            send_reply(token, f"⏳ 正在同步清空，請稍候...")
             try:
                 results = delete_ep_from_sheets(show_name, ep_num=ep_num, date_str=date_str)
             except Exception as e:
                 send_reply(token, f"刪除失敗：{e}"); return
             bust()
-            msg = f"🗑 刪集數完成 {show_name} EP{ep_num}（{date_str}）\n\n" + "\n".join(results) if results else f"找不到 {show_name} EP{ep_num}（{date_str}）的集數"
-            send_reply(token, msg)
+            scope = f"（{date_str}）" if date_str else "（所有日期）"
+            msg = f"🗑️ 刪集數完成 {show_name} EP{ep_num}{scope}\n\n" + "\n".join(results) if results else "找不到符合的集數"
+            send_reply(token, msg); return
+
+    # ── 日期回覆 ──
+    date_raw = re.match(r'^(\d{1,2})[/\-月](\d{1,2})日?$', text.strip())
+    if date_raw and USER_ID in _pending:
+        pending   = _pending.pop(USER_ID)
+        show_name = pending["show_name"]
+        ep_num    = pending.get("ep_num")
+        action    = pending.get("action", "status")
+        date_str  = f"{int(date_raw.group(1))}/{int(date_raw.group(2))}"
+
+        if action == "delete":
+            # 先顯示預覽，進入 delete_confirm 等待確認
+            _pending[USER_ID] = {
+                "action":    "delete_confirm",
+                "show_name": show_name,
+                "ep_num":    ep_num,
+                "date_str":  date_str,
+            }
+            send_reply(token,
+                f"⚠️ 即將刪除 {show_name} EP{ep_num}（{date_str}）\n"
+                f"三張表同步清空，此操作不可復原。\n"
+                f"輸入「確認刪除」繼續 / 「取消」放棄")
+
+        elif action == "add":
+            # 先查是否有重複排程
+            try:
+                sh           = get_confirm_sheet()
+                confirm_rows = sh.get_all_values()
+                existing     = check_existing_schedule(confirm_rows, date_str, show_name)
+            except Exception as e:
+                send_reply(token, f"查詢失敗：{e}"); return
+
+            if existing:
+                existing_str = "、".join(existing)
+                _pending[USER_ID] = {
+                    "action":    "add_confirm",
+                    "show_name": show_name,
+                    "ep_num":    ep_num,
+                    "date_str":  date_str,
+                }
+                send_reply(token,
+                    f"⚠️ {date_str} {show_name} 已有排程：{existing_str}\n"
+                    f"確定要覆蓋為 EP{ep_num} 嗎？\n"
+                    f"輸入「確認」覆蓋 / 「取消」放棄")
+            else:
+                send_reply(token, f"⏳ 正在同步更新三張表，請稍候...")
+                try:
+                    results = write_to_schedule_sheets(show_name, ep_num, date_str=date_str, action="add")
+                except Exception as e:
+                    send_reply(token, f"更新失敗：{e}"); return
+                bust()
+                msg = f"✅ 新增排程完成 {show_name} EP{ep_num}（{date_str}）\n\n" + "\n".join(results) if results else f"找不到 {date_str} {show_name} 的對應欄位"
+                send_reply(token, msg)
+
         else:
             found_status = pending["status"]
             label = {S_SCHED:"已排程", S_DONE:"✓ 已上片",
@@ -659,14 +1035,58 @@ def on_msg(event):
                     sync_results = write_to_schedule_sheets(show_name, ep_num, date_str=date_str, action="add")
                 bust()
                 msg = f"✅ {show_name} EP{ep_num} 狀態 → {label}\n"
-                if status_results:
-                    msg += "\n".join(status_results)
-                if sync_results:
-                    msg += f"\n\n📋 集數同步（{date_str}）：\n" + "\n".join(sync_results)
+                if status_results: msg += "\n".join(status_results)
+                if sync_results:   msg += f"\n\n📋 集數同步（{date_str}）：\n" + "\n".join(sync_results)
                 send_reply(token, msg)
             except Exception as e:
                 send_reply(token, f"更新失敗：{e}")
         return
+
+    # ── EP 號回覆 ──
+    ep_only = re.match(r'^[Ee][Pp]\s*(\d+)$', text.strip())
+    if ep_only and USER_ID in _pending:
+        pending = _pending.get(USER_ID, {})
+        if pending.get("action") == "date_show_ask_ep":
+            _pending.pop(USER_ID)
+            ep_num    = ep_only.group(1)
+            show_name = pending["show_name"]
+            date_str  = pending["date_str"]
+            # 同樣做衝突檢查
+            try:
+                sh           = get_confirm_sheet()
+                confirm_rows = sh.get_all_values()
+                existing     = check_existing_schedule(confirm_rows, date_str, show_name)
+            except Exception as e:
+                send_reply(token, f"查詢失敗：{e}"); return
+            if existing:
+                existing_str = "、".join(existing)
+                _pending[USER_ID] = {
+                    "action":    "add_confirm",
+                    "show_name": show_name,
+                    "ep_num":    ep_num,
+                    "date_str":  date_str,
+                }
+                send_reply(token,
+                    f"⚠️ {date_str} {show_name} 已有排程：{existing_str}\n"
+                    f"確定要覆蓋為 EP{ep_num} 嗎？\n"
+                    f"輸入「確認」覆蓋 / 「取消」放棄"); return
+            send_reply(token, f"⏳ 正在同步更新三張表，請稍候...")
+            try:
+                results = write_to_schedule_sheets(show_name, ep_num, date_str=date_str, action="add")
+            except Exception as e:
+                send_reply(token, f"更新失敗：{e}"); return
+            bust()
+            msg = f"✅ 新增排程完成 {show_name} EP{ep_num}（{date_str}）\n\n" + "\n".join(results) if results else f"找不到 {date_str} {show_name} 的對應欄位"
+            send_reply(token, msg); return
+
+    # ── 狀態更新 ──
+    found_status = None
+    found_key    = None
+    for key in sorted(STATUS_MAP.keys(), key=len, reverse=True):
+        if key in text:
+            found_status = STATUS_MAP[key]
+            found_key    = key
+            break
 
     if found_status:
         remaining = text.replace(found_key, "").strip()
@@ -676,88 +1096,127 @@ def on_msg(event):
         show_raw  = re.sub(r'EP\s*\d+', '', remaining, flags=re.IGNORECASE).strip()
         show_raw  = re.sub(r'\d+', '', show_raw).strip()
         show_name = normalize_show(show_raw)
-
         if not show_name:
             send_reply(token, "找不到節目名稱，請輸入如：董律師EP176 已排程"); return
         try:
             sh = get_confirm_sheet()
         except Exception as e:
             send_reply(token, f"連線失敗：{e}"); return
-
         matched = find_confirm_rows(sh, show_name, ep_num)
         if not matched:
             ep_str = f"EP{ep_num}" if ep_num else "（未指定集數）"
             send_reply(token, f"找不到「{show_name} {ep_str}」\n輸入「今日」查看今日清單"); return
-
-        # 1. 更新確認表平台狀態
         status_results = []
         for row_num, row_data in matched:
             updated = update_platforms(sh, row_num, row_data, found_status)
             status_results.append(f"  {row_data[0]} {row_data[4]} [{' '.join(updated)}]")
-
         label = {S_SCHED:"已排程", S_DONE:"✓ 已上片",
                  S_ERR:"⚠ 不上片", S_SKIP:"—未排程"}.get(found_status, found_status)
-
-        # 2. 如果有集數，詢問日期後同步四張表
         if ep_num:
-            # 儲存待確認狀態
-            _pending[USER_ID] = {
-                "show_name": show_name,
-                "ep_num":    ep_num,
-                "status":    found_status,
-            }
+            _pending[USER_ID] = {"show_name": show_name, "ep_num": ep_num, "status": found_status}
             bust()
-            msg  = f"✅ {show_name} EP{ep_num} 狀態 → {label}\n"
-            msg += "\n".join(status_results)
-            msg += f"\n\n📅 請問是哪一天的排程？\n輸入日期同步四張表，例：4/10\n（輸入「略過」跳過同步）"
+            msg  = f"✅ {show_name} EP{ep_num} 狀態 → {label}\n" + "\n".join(status_results)
+            msg += f"\n\n📅 請問是哪一天的排程？\n輸入日期同步，例：4/10\n（輸入「略過」跳過 / 「取消」放棄）"
             send_reply(token, msg)
         else:
             bust()
             send_reply(token, f"✅ {show_name} 狀態 → {label}\n" + "\n".join(status_results))
         return
 
-    # ══════════════════════════════════════════
-    # 刪集數：同步清空三張表
-    # 格式：刪集數 董律師 EP178
-    #       刪集數 董律師 4/10
-    # ══════════════════════════════════════════
-    if re.match(r'^(刪集數|刪除集數|清空集數|刪ep|刪EP)', text):
-        remaining  = re.sub(r'^(刪集數|刪除集數|清空集數|刪[Ee][Pp])\s*', '', text).strip()
+    # ── 刪除排程 ──
+    if re.match(r'^(刪集數|刪除集數|清空集數|刪ep|刪EP|刪除)', text):
+        remaining  = re.sub(r'^(刪集數|刪除集數|清空集數|刪[Ee][Pp]|刪除)\s*', '', text).strip()
         ep_match   = re.search(r'EP\s*(\d+)', remaining, re.IGNORECASE)
         ep_num     = ep_match.group(1) if ep_match else None
-        date_match = re.search(r'(\d{1,2})[/月](\d{1,2})', remaining)
-        date_str   = f"{date_match.group(1)}/{date_match.group(2)}" if date_match else None
+        date_match = re.search(r'(\d{1,2})[/\-月](\d{1,2})日?', remaining)
+        date_str   = f"{int(date_match.group(1))}/{int(date_match.group(2))}" if date_match else None
         show_raw   = re.sub(r'EP\s*\d+', '', remaining, flags=re.IGNORECASE)
-        show_raw   = re.sub(r'\d{1,2}[/月]\d{1,2}', '', show_raw).strip()
+        show_raw   = re.sub(r'\d{1,2}[/\-月]\d{1,2}日?', '', show_raw).strip()
         show_name  = normalize_show(show_raw)
-
         if not show_name or not ep_num:
-            send_reply(token,
-                "格式：刪集數 節目名 EP號\n"
-                "例：刪集數 董律師 EP178"); return
-
-        # 若已有日期直接執行，否則詢問日期
+            send_reply(token, "格式：刪除 節目名 EP號\n例：刪除 董律師 EP178"); return
         if date_str:
-            send_reply(token, f"⏳ 正在同步清空四張表，請稍候...")
-            try:
-                results = delete_ep_from_sheets(show_name, ep_num=ep_num, date_str=date_str)
-            except Exception as e:
-                send_reply(token, f"刪除失敗：{e}"); return
-            bust()
-            target = f"EP{ep_num}（{date_str}）"
-            msg = f"🗑 刪集數完成 {show_name} {target}\n\n" + "\n".join(results) if results else f"找不到 {show_name} {target} 的集數"
-            send_reply(token, msg)
-        else:
-            # 儲存待確認日期
+            # 先顯示預覽，進入二次確認
             _pending[USER_ID] = {
+                "action":    "delete_confirm",
                 "show_name": show_name,
                 "ep_num":    ep_num,
-                "action":    "delete",
+                "date_str":  date_str,
             }
             send_reply(token,
+                f"⚠️ 即將刪除 {show_name} EP{ep_num}（{date_str}）\n"
+                f"三張表同步清空，此操作不可復原。\n"
+                f"輸入「確認刪除」繼續 / 「取消」放棄")
+        else:
+            _pending[USER_ID] = {"show_name": show_name, "ep_num": ep_num, "action": "delete"}
+            send_reply(token,
                 f"📅 請問要刪除哪一天的 {show_name} EP{ep_num}？\n"
-                f"輸入日期同步四張表，例：4/10\n"
-                f"（輸入「略過」刪除所有符合的）")
+                f"輸入日期，例：4/10\n（輸入「略過」刪除所有符合的 / 「取消」放棄）")
+        return
+
+    # ── 日期+節目 → 問EP ──
+    date_show_m = re.match(r'^(\d{1,2})[/\-月](\d{1,2})日?\s+(.+)$', text.strip())
+    if date_show_m:
+        date_str  = f"{int(date_show_m.group(1))}/{int(date_show_m.group(2))}"
+        show_raw  = date_show_m.group(3).strip()
+        candidates = get_ambiguous_candidates(show_raw)
+        if candidates:
+            _pending[USER_ID] = {"action": "disambig_then_ep", "date_str": date_str, "candidates": candidates}
+            send_reply(token,
+                f"📺 {date_str} 「{show_raw}」是哪個節目？\n"
+                f"請回覆：{'  '.join(candidates)}\n（輸入「取消」放棄）")
+            return
+        show_name = normalize_show(show_raw)
+        _pending[USER_ID] = {"action": "date_show_ask_ep", "date_str": date_str, "show_name": show_name}
+        send_reply(token,
+            f"📺 {date_str} {show_name} 是第幾集？\n"
+            f"請輸入 EP 號碼，例：EP178 或 ep178\n（輸入「取消」放棄）")
+        return
+
+    # ── 歧義節目確認 ──
+    if USER_ID in _pending and _pending[USER_ID].get("action") == "disambig_then_ep":
+        pending    = _pending.get(USER_ID)
+        candidates = pending["candidates"]
+        matched_show = next((c for c in candidates if text.strip() in c or c in text.strip()), None)
+        if matched_show:
+            pending["action"]    = "date_show_ask_ep"
+            pending["show_name"] = matched_show
+            _pending[USER_ID]    = pending
+            send_reply(token,
+                f"📺 {pending['date_str']} {matched_show} 是第幾集？\n"
+                f"請輸入 EP 號碼，例：EP178\n（輸入「取消」放棄）")
+        else:
+            send_reply(token, f"請輸入：{'  '.join(candidates)}　（或「取消」放棄）")
+        return
+
+    # ── 查詢 ──
+    if re.match(r'^(查詢|查|search)\s*', text):
+        query = re.sub(r'^(查詢|查|search)\s*', '', text).strip()
+        if not query:
+            send_reply(token, "格式：查 節目名  或  查 日期\n例：查 董律師 / 查 4/10"); return
+        date_q = re.match(r'^(\d{1,2})[/\-月](\d{1,2})日?$', query)
+        try:
+            sh       = get_confirm_sheet()
+            rows_all = sh.get_all_values()
+            found    = []
+            if date_q:
+                target = f"{int(date_q.group(1))}/{int(date_q.group(2))}"
+                for row in rows_all:
+                    if len(row) >= 5 and row[0].strip() == target and row[3].strip():
+                        found.append(f"  {row[2]} {row[3]} {row[4]}")
+                header = f"📅 {target} 的排程"
+            else:
+                show_name = normalize_show(query)
+                for row in rows_all:
+                    if len(row) >= 5 and row[3].strip() and (
+                        show_name.lower() in row[3].lower() or row[3].lower() in show_name.lower()
+                    ):
+                        found.append(f"  {row[0]} {row[2]} {row[4]}")
+                header = f"📺 {show_name} 排程清單"
+            msg = f"{header}（{len(found)}筆）\n" + "\n".join(found) if found else f"找不到「{query}」的排程資料"
+            send_reply(token, msg)
+        except Exception as e:
+            send_reply(token, f"查詢失敗：{e}")
         return
 
     # ── 說明 ──
@@ -766,19 +1225,25 @@ def on_msg(event):
         "──────────────\n"
         "【確認上片狀態】\n"
         "  董律師EP177 已排程\n"
-        "  董律師EP177 已上片\n"
-        "  董律師EP177 不上片\n\n"
-        "【補集數（同步四張表）】\n"
+        "  董律師EP177 已上片\n\n"
+        "【新增排程（兩步）】\n"
+        "  新增 董律師 EP178\n"
+        "  → Bot 問日期，輸入 4/10\n\n"
+        "【刪除排程（兩步）】\n"
+        "  刪除 董律師 EP178\n"
+        "  → Bot 問日期，輸入 4/10\n\n"
+        "【日期+節目（自動問集數）】\n"
+        "  4/10 董律師\n"
+        "  → Bot 問集數，輸入 EP178\n\n"
+        "【補集數】\n"
         "  補集數 董律師 EP178\n\n"
-        "【刪集數（同步四張表）】\n"
-        "  刪集數 董律師 EP178\n"
-        "  刪集數 董律師 4/10\n\n"
-        "【新增/更新排程（同步四張表）】\n"
-        "  新增 董律師 EP178 4/10\n\n"
+        "【建立新月份表單】\n"
+        "  建立5月表單\n"
+        "  建立5月表單 覆蓋（已存在時覆蓋）\n\n"
+        "【查詢】\n"
+        "  查 董律師  或  查 4/10\n\n"
         "【其他】\n"
-        "  今日　查看今日清單\n"
-        "  全部　今日全部標記已上片\n"
-        "  狀態　查看今日進度"
+        "  今日  狀態  全部  取消"
     )
 
 @app.route("/")
@@ -787,4 +1252,3 @@ def index():
 
 if __name__ == "__main__":
     app.run(port=int(os.environ.get("PORT", 5000)))
-# patch marker
