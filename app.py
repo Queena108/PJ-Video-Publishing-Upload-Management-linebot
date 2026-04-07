@@ -310,31 +310,40 @@ def find_confirm_rows(sheet, show_name, ep_num):
             matched.append((i + 1, row))
     return matched
 
-def update_platforms(sheet, row_num, row_data, new_status):
+def update_platforms(sheet, row_num, row_data, new_status, show_name=None):
+    """
+    更新確認表的平台欄位。
+    優先用 SHOW_META 判斷該節目實際使用哪些平台，
+    避免因為欄位當前值是 —未排程 而被誤跳過。
+    同步更新 限動（col 9）和 全部完成?（col 10）。
+    """
     updates = []
-    for plat, col in [("IG/FB", 6), ("TK", 7), ("YT", 8)]:
-        cur = row_data[col - 1] if len(row_data) >= col else ""
-        if cur.strip() not in (S_SKIP, ""):
+    # (平台顯示名, gspread欄號, SHOW_META keys)
+    plat_map = [
+        ("IG/FB", 6, ["IG", "FB"]),
+        ("TK",    7, ["TK"]),
+        ("YT",    8, ["YT"]),
+        ("限動",  9, ["限動"]),
+    ]
+
+    for plat, col, keys in plat_map:
+        if show_name and show_name in SHOW_META:
+            # 用 SHOW_META 判斷：只更新節目實際有的平台
+            applies = any(k in SHOW_META[show_name]["platforms"] for k in keys)
+        else:
+            # fallback：欄位有值（含 —未排程）就更新，空白才跳過
+            cur = row_data[col - 1] if len(row_data) >= col else ""
+            applies = cur.strip() != ""
+
+        if applies:
             sheet.update_cell(row_num, col, new_status)
             updates.append(plat)
-    return updates
 
-def check_existing_schedule(confirm_rows, date_str, show_name):
-    """
-    查確認表，回傳指定日期+節目已有的集數清單（排除空行）。
-    回傳 [] 代表該日期節目尚無排程，可直接新增。
-    """
-    found = []
-    for row in confirm_rows:
-        if len(row) < 5: continue
-        if row[0].strip() != date_str: continue
-        row_show = row[3].strip()
-        row_ep   = row[4].strip()
-        show_match = (show_name.lower() in row_show.lower() or
-                      row_show.lower() in show_name.lower())
-        if show_match and row_show and row_ep:
-            found.append(row_ep)
-    return found
+    # 「全部完成?」欄（col 10）：已排程 或 已上片 才更新，不上片/未排程 不動
+    if updates and new_status in (S_SCHED, S_DONE):
+        sheet.update_cell(row_num, 10, new_status)
+
+    return updates
 
 
 # ════════════════════════════════════════════
@@ -827,7 +836,7 @@ def on_msg(event):
         sh = get_confirm_sheet(); count = 0
         for r in rows:
             if S_DONE not in r["status"]:
-                update_platforms(sh, r["row_num"], sh.row_values(r["row_num"]), S_DONE)
+                update_platforms(sh, r["row_num"], sh.row_values(r["row_num"]), S_DONE, show_name=r["name"])
                 count += 1
         bust()
         send_reply(token, f"✅ 今日 {count} 個節目全部標記已上片！"); return
@@ -916,55 +925,16 @@ def on_msg(event):
         show_name = pending["show_name"]
         ep_num    = pending.get("ep_num")
         if action == "delete":
-            # 略過日期過濾 → 刪除所有符合 → 先顯示確認
-            _pending[USER_ID] = {
-                "action":    "delete_confirm",
-                "show_name": show_name,
-                "ep_num":    ep_num,
-                "date_str":  None,
-            }
-            send_reply(token,
-                f"⚠️ 即將刪除所有日期的 {show_name} EP{ep_num}\n"
-                f"此操作不可復原，確定繼續？\n"
-                f"輸入「確認刪除」繼續 / 「取消」放棄")
-        else:
-            send_reply(token, "✅ 已略過集數同步。")
-        return
-
-    # ── 二次確認：確認新增（覆蓋衝突） ──
-    if text in ("確認", "confirm", "覆蓋") and USER_ID in _pending:
-        pending = _pending.get(USER_ID, {})
-        if pending.get("action") == "add_confirm":
-            _pending.pop(USER_ID)
-            show_name = pending["show_name"]
-            ep_num    = pending["ep_num"]
-            date_str  = pending["date_str"]
-            send_reply(token, f"⏳ 正在同步更新三張表，請稍候...")
             try:
-                results = write_to_schedule_sheets(show_name, ep_num, date_str=date_str, action="add")
-            except Exception as e:
-                send_reply(token, f"更新失敗：{e}"); return
-            bust()
-            msg = f"✅ 新增排程完成 {show_name} EP{ep_num}（{date_str}）\n\n" + "\n".join(results) if results else f"找不到 {date_str} {show_name} 的對應欄位"
-            send_reply(token, msg); return
-
-    # ── 二次確認：確認刪除 ──
-    if text in ("確認刪除", "確定刪除", "刪除確認") and USER_ID in _pending:
-        pending = _pending.get(USER_ID, {})
-        if pending.get("action") == "delete_confirm":
-            _pending.pop(USER_ID)
-            show_name = pending["show_name"]
-            ep_num    = pending["ep_num"]
-            date_str  = pending.get("date_str")
-            send_reply(token, f"⏳ 正在同步清空，請稍候...")
-            try:
-                results = delete_ep_from_sheets(show_name, ep_num=ep_num, date_str=date_str)
+                results = delete_ep_from_sheets(show_name, ep_num=ep_num)
             except Exception as e:
                 send_reply(token, f"刪除失敗：{e}"); return
             bust()
-            scope = f"（{date_str}）" if date_str else "（所有日期）"
-            msg = f"🗑️ 刪集數完成 {show_name} EP{ep_num}{scope}\n\n" + "\n".join(results) if results else "找不到符合的集數"
-            send_reply(token, msg); return
+            msg = f"🗑️ 刪集數完成 {show_name} EP{ep_num}（所有日期）\n\n" + "\n".join(results) if results else "找不到符合的集數"
+            send_reply(token, msg)
+        else:
+            send_reply(token, "✅ 已略過集數同步。")
+        return
 
     # ── 日期回覆 ──
     date_raw = re.match(r'^(\d{1,2})[/\-月](\d{1,2})日?$', text.strip())
@@ -976,48 +946,23 @@ def on_msg(event):
         date_str  = f"{int(date_raw.group(1))}/{int(date_raw.group(2))}"
 
         if action == "delete":
-            # 先顯示預覽，進入 delete_confirm 等待確認
-            _pending[USER_ID] = {
-                "action":    "delete_confirm",
-                "show_name": show_name,
-                "ep_num":    ep_num,
-                "date_str":  date_str,
-            }
-            send_reply(token,
-                f"⚠️ 即將刪除 {show_name} EP{ep_num}（{date_str}）\n"
-                f"三張表同步清空，此操作不可復原。\n"
-                f"輸入「確認刪除」繼續 / 「取消」放棄")
+            try:
+                results = delete_ep_from_sheets(show_name, ep_num=ep_num, date_str=date_str)
+            except Exception as e:
+                send_reply(token, f"刪除失敗：{e}"); return
+            bust()
+            msg = f"🗑️ {show_name} EP{ep_num}（{date_str}）\n\n" + "\n".join(results) if results else f"找不到對應資料"
+            send_reply(token, msg)
 
         elif action == "add":
-            # 先查是否有重複排程
+            send_reply(token, f"⏳ 正在同步更新三張表，請稍候...")
             try:
-                sh           = get_confirm_sheet()
-                confirm_rows = sh.get_all_values()
-                existing     = check_existing_schedule(confirm_rows, date_str, show_name)
+                results = write_to_schedule_sheets(show_name, ep_num, date_str=date_str, action="add")
             except Exception as e:
-                send_reply(token, f"查詢失敗：{e}"); return
-
-            if existing:
-                existing_str = "、".join(existing)
-                _pending[USER_ID] = {
-                    "action":    "add_confirm",
-                    "show_name": show_name,
-                    "ep_num":    ep_num,
-                    "date_str":  date_str,
-                }
-                send_reply(token,
-                    f"⚠️ {date_str} {show_name} 已有排程：{existing_str}\n"
-                    f"確定要覆蓋為 EP{ep_num} 嗎？\n"
-                    f"輸入「確認」覆蓋 / 「取消」放棄")
-            else:
-                send_reply(token, f"⏳ 正在同步更新三張表，請稍候...")
-                try:
-                    results = write_to_schedule_sheets(show_name, ep_num, date_str=date_str, action="add")
-                except Exception as e:
-                    send_reply(token, f"更新失敗：{e}"); return
-                bust()
-                msg = f"✅ 新增排程完成 {show_name} EP{ep_num}（{date_str}）\n\n" + "\n".join(results) if results else f"找不到 {date_str} {show_name} 的對應欄位"
-                send_reply(token, msg)
+                send_reply(token, f"更新失敗：{e}"); return
+            bust()
+            msg = f"✅ 新增排程完成 {show_name} EP{ep_num}（{date_str}）\n\n" + "\n".join(results) if results else f"找不到 {date_str} {show_name} 的對應欄位"
+            send_reply(token, msg)
 
         else:
             found_status = pending["status"]
@@ -1028,11 +973,7 @@ def on_msg(event):
                 matched = find_confirm_rows(sh, show_name, ep_num)
                 status_results = []
                 for row_num, row_data in matched:
-                    updated = update_platforms(sh, row_num, row_data, found_status)
-                    status_results.append(f"  {row_data[0]} {row_data[4]} [{' '.join(updated)}]")
-                sync_results = []
-                if ep_num:
-                    sync_results = write_to_schedule_sheets(show_name, ep_num, date_str=date_str, action="add")
+                    updated = update_platforms(sh, row_num, row_data, found_status, show_name=show_name)
                 bust()
                 msg = f"✅ {show_name} EP{ep_num} 狀態 → {label}\n"
                 if status_results: msg += "\n".join(status_results)
@@ -1051,25 +992,6 @@ def on_msg(event):
             ep_num    = ep_only.group(1)
             show_name = pending["show_name"]
             date_str  = pending["date_str"]
-            # 同樣做衝突檢查
-            try:
-                sh           = get_confirm_sheet()
-                confirm_rows = sh.get_all_values()
-                existing     = check_existing_schedule(confirm_rows, date_str, show_name)
-            except Exception as e:
-                send_reply(token, f"查詢失敗：{e}"); return
-            if existing:
-                existing_str = "、".join(existing)
-                _pending[USER_ID] = {
-                    "action":    "add_confirm",
-                    "show_name": show_name,
-                    "ep_num":    ep_num,
-                    "date_str":  date_str,
-                }
-                send_reply(token,
-                    f"⚠️ {date_str} {show_name} 已有排程：{existing_str}\n"
-                    f"確定要覆蓋為 EP{ep_num} 嗎？\n"
-                    f"輸入「確認」覆蓋 / 「取消」放棄"); return
             send_reply(token, f"⏳ 正在同步更新三張表，請稍候...")
             try:
                 results = write_to_schedule_sheets(show_name, ep_num, date_str=date_str, action="add")
@@ -1108,7 +1030,7 @@ def on_msg(event):
             send_reply(token, f"找不到「{show_name} {ep_str}」\n輸入「今日」查看今日清單"); return
         status_results = []
         for row_num, row_data in matched:
-            updated = update_platforms(sh, row_num, row_data, found_status)
+            updated = update_platforms(sh, row_num, row_data, found_status, show_name=show_name)
             status_results.append(f"  {row_data[0]} {row_data[4]} [{' '.join(updated)}]")
         label = {S_SCHED:"已排程", S_DONE:"✓ 已上片",
                  S_ERR:"⚠ 不上片", S_SKIP:"—未排程"}.get(found_status, found_status)
@@ -1136,17 +1058,14 @@ def on_msg(event):
         if not show_name or not ep_num:
             send_reply(token, "格式：刪除 節目名 EP號\n例：刪除 董律師 EP178"); return
         if date_str:
-            # 先顯示預覽，進入二次確認
-            _pending[USER_ID] = {
-                "action":    "delete_confirm",
-                "show_name": show_name,
-                "ep_num":    ep_num,
-                "date_str":  date_str,
-            }
-            send_reply(token,
-                f"⚠️ 即將刪除 {show_name} EP{ep_num}（{date_str}）\n"
-                f"三張表同步清空，此操作不可復原。\n"
-                f"輸入「確認刪除」繼續 / 「取消」放棄")
+            send_reply(token, f"⏳ 正在同步清空，請稍候...")
+            try:
+                results = delete_ep_from_sheets(show_name, ep_num=ep_num, date_str=date_str)
+            except Exception as e:
+                send_reply(token, f"刪除失敗：{e}"); return
+            bust()
+            msg = f"🗑️ 刪集數完成 {show_name} EP{ep_num}（{date_str}）\n\n" + "\n".join(results) if results else f"找不到對應集數"
+            send_reply(token, msg)
         else:
             _pending[USER_ID] = {"show_name": show_name, "ep_num": ep_num, "action": "delete"}
             send_reply(token,
@@ -1252,3 +1171,4 @@ def index():
 
 if __name__ == "__main__":
     app.run(port=int(os.environ.get("PORT", 5000)))
+
